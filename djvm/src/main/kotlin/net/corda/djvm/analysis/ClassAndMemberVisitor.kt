@@ -4,10 +4,7 @@ import net.corda.djvm.code.EmitterModule
 import net.corda.djvm.code.Instruction
 import net.corda.djvm.code.instructions.*
 import net.corda.djvm.messages.Message
-import net.corda.djvm.references.ClassReference
-import net.corda.djvm.references.ClassRepresentation
-import net.corda.djvm.references.Member
-import net.corda.djvm.references.MemberReference
+import net.corda.djvm.references.*
 import net.corda.djvm.source.SourceClassLoader
 import org.objectweb.asm.*
 import java.io.InputStream
@@ -167,7 +164,8 @@ open class ClassAndMemberVisitor(
     }
 
     /**
-     * Run action with a guard that populates [messages] based on the output.
+     * Run action with a guard that populates [AnalysisRuntimeContext.messages]
+     * based on the output.
      */
     private inline fun captureExceptions(action: () -> Unit): Boolean {
         return try {
@@ -306,14 +304,15 @@ open class ClassAndMemberVisitor(
             configuration.memberModule.addToClass(clazz, visitedMember ?: member)
             return if (processMember) {
                 val derivedMember = visitedMember ?: member
-                val targetVisitor = super.visitMethod(
-                        derivedMember.access,
-                        derivedMember.memberName,
-                        derivedMember.signature,
-                        signature,
-                        derivedMember.exceptions.toTypedArray()
-                )
-                MethodVisitorImpl(targetVisitor)
+                super.visitMethod(
+                    derivedMember.access,
+                    derivedMember.memberName,
+                    derivedMember.signature,
+                    signature,
+                    derivedMember.exceptions.toTypedArray()
+                )?.let { targetVisitor ->
+                    MethodVisitorImpl(targetVisitor, derivedMember.body)
+                }
             } else {
                 null
             }
@@ -359,7 +358,8 @@ open class ClassAndMemberVisitor(
      * Visitor used to traverse and analyze a method.
      */
     private inner class MethodVisitorImpl(
-            targetVisitor: MethodVisitor?
+            targetVisitor: MethodVisitor?,
+            private val bodies: List<MethodBody>
     ) : MethodVisitor(API_VERSION, targetVisitor) {
 
         /**
@@ -385,6 +385,16 @@ open class ClassAndMemberVisitor(
         override fun visitAnnotation(desc: String, visible: Boolean): AnnotationVisitor? {
             visitMemberAnnotation(desc)
             return super.visitAnnotation(desc, visible)
+        }
+
+        /**
+         * Write any new method body code, assuming the definition providers
+         * have provided any. This handler will not be visited if this method
+         * has no existing code.
+         */
+        override fun visitCode() {
+            super.visitCode()
+            tryReplaceMethodBody()
         }
 
         /**
@@ -490,6 +500,27 @@ open class ClassAndMemberVisitor(
         override fun visitIincInsn(`var`: Int, increment: Int) {
             visit(IntegerInstruction(Opcodes.IINC, increment)) {
                 super.visitIincInsn(`var`, increment)
+            }
+        }
+
+        /**
+         * Finish visiting this method, writing any new method body byte-code
+         * if we haven't written it already. This would (presumably) only happen
+         * for methods that previously had no body, e.g. native methods.
+         */
+        override fun visitEnd() {
+            tryReplaceMethodBody()
+            super.visitEnd()
+        }
+
+        private fun tryReplaceMethodBody() {
+            if (bodies.isNotEmpty() && (mv != null)) {
+                for (body in bodies) {
+                    body(mv)
+                }
+                mv.visitMaxs(-1, -1)
+                mv.visitEnd()
+                mv = null
             }
         }
 
